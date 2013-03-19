@@ -43,10 +43,6 @@ def parse_options(args):
                       help="Name to use for the image")
     imgopt.add_option("-e", "--extract-bootfiles", action="store_true", dest="extract_bootfiles",
                       help="Extract the kernel and ramdisk from the image")
-    imgopt.add_option("-m", "--map-scsi-devices", action="store_true", dest="map_scsi_devices",
-                      help="Create symlinks to xvd* devices from sd* for Xen support")
-    imgopt.add_option("", "--xvd-offset", action="store_true", dest="xvd_offset",
-                      help="Map sd[a-v] to xvd[e-z] (offset by four for EL 6.x)")
     parser.add_option_group(imgopt)
 
     # options related to the config of your system
@@ -75,9 +71,6 @@ def parse_options(args):
     return options
 
 class AmiCreator(imgcreate.LoopImageCreator):
-    map_scsi_devices = False
-    xvd_offset = False
-
     def __init__(self, *args, **kwargs):
         imgcreate.LoopImageCreator.__init__(self, *args, **kwargs)
 
@@ -88,30 +81,6 @@ class AmiCreator(imgcreate.LoopImageCreator):
                           "sd_mod", "mptsas", "sg", "acpiphp" ]
         self.__modules.extend(imgcreate.kickstart.get_modules(self.ks))
 
-    def _get_disk_type(self):
-        """Get the root disk type (xvd vs sd)
-
-        Older Xen kernels can end up with the rootfs as /dev/sda1
-        while newer paravirt ops kernels don't do the major stealing
-        and instead just end up xvd as you'd maybe expect.
-
-        Return sd or xvd based on the type of kernel being installed
-        """
-
-        # if use specify --ondisk, we'll use that as a cue
-        if len(imgcreate.kickstart.get_partitions(self.ks)) > 0:
-            for part in imgcreate.kickstart.get_partitions(self.ks):
-                if part.disk and part.disk.startswith("xvd"):
-                    return "xvd"
-                elif part.disk and part.disk.startswith("sd"):
-                    return "sd"
-                elif part.disk and part.disk.startswith("vd"):
-                    return "vd"
-
-        # otherwise, is this a good criteria?  it works for centos5 vs f14
-        if "kernel-xen" in self.ks.handler.packages.packageList:
-            return "sd"
-        return "xvd"
         
     # FIXME: refactor into imgcreate.LoopImageCreator
     def _get_kernel_options(self):
@@ -206,76 +175,6 @@ rootopts="defaults"
         self.__write_mkinitrd_conf(self._instroot + "/etc/sysconfig/mkinitrd/ami.conf")
         # and rhel/centos6 and current fedora (f12+) use dracut anyway
         self.__write_dracut_conf(self._instroot + "/etc/dracut.conf.d/ami.conf")
-        if self.map_scsi_devices:
-            self.__write_udev_config()
-
-    def __write_udev_config(self):
-        if self.map_scsi_devices:
-            with open(self._instroot + "/etc/dracut.conf.d/ami.conf", "a") as f:
-                f.write('add_dracutmodules+=" ami-udev "\n')
-
-        udev_rules = self._instroot + "/etc/udev/rules.d/99-ami-udev.rules"
-        if not os.path.exists(os.path.dirname(udev_rules)):
-            os.makedirs(os.path.dirname(udev_rules))
-        with open(udev_rules, "w") as f:
-            f.write('KERNEL=="xvd*", PROGRAM="/usr/sbin/ami-udev %k", SYMLINK+="%c"\n')
-
-        # We can't know whether this goes in /usr/lib or /usr/share,
-        # so write to both.  Yuck.
-        for x in [ self._instroot + "/usr/lib/dracut/modules.d/99ami-udev",
-                   self._instroot + "/usr/share/dracut/modules.d/99ami-udev" ]:
-            if not os.path.exists(x):
-                os.makedirs(x)
-            modulesetup = x + "/module-setup.sh"
-            with open(modulesetup, "w") as f:
-                f.write('''#!/bin/bash
-install() {
-    inst_rules 99-ami-udev.rules
-    dracut_install /usr/sbin/ami-udev
-    dracut_install /bin/grep
-}
-''')
-            os.chmod(modulesetup, 0755)
-
-            # EL 6 dracut is different. Just make it source module-setup
-            with open(x + "/install", "w") as f:
-                f.write('''#!/bin/sh
-source $( dirname $BASH_SOURCE )/module-setup.sh
-install
-''')
-            os.chmod(x + "/install", 0755)
-
-        amiudev = self._instroot + "/usr/sbin/ami-udev"
-        if not os.path.exists(os.path.dirname(amiudev)):
-            os.makedirs(os.path.dirname(amiudev))
-        with open(amiudev, "w") as f:
-            if self.xvd_offset:
-                f.write('''#!/bin/bash
-if [ "$#" -ne 1 ] ; then
-  echo "$0 <device>" >&2
-  exit 1
-else
-  if echo "$1"|grep -qE 'xvd[a-z][0-9]?' ; then
-    echo sd$( echo ${1:3:1} | sed "y/[e-v]/[a-z]/" )${1:4:2}
-  else
-    echo "$1"
-  fi
-fi
-''')
-            else:
-                f.write('''#!/bin/bash
-if [ "$#" -ne 1 ] ; then
-  echo "$0 <device>" >&2
-  exit 1
-else
-  if echo "$1"|grep -qE 'xvd[a-z][0-9]?' ; then
-    echo "$1" | sed -e 's/xvd/sd/'
-  else
-    echo "$1"
-  fi
-fi
-''')
-        os.chmod(amiudev, 0755)
 
     def package(self, destdir="."):
         imgcreate.LoopImageCreator.package(self, destdir)
@@ -301,10 +200,6 @@ def main():
     creator.tmpdir = os.path.abspath(options.tmpdir)
     if options.cachedir:
         options.cachedir = os.path.abspath(options.cachedir)
-    if options.xvd_offset:
-        creator.xvd_offset = True
-    if options.map_scsi_devices:
-        creator.map_scsi_devices = True
 
     try:
         creator.mount(cachedir=options.cachedir)
